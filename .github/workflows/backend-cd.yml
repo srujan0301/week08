@@ -6,14 +6,15 @@ on:
 env:
   RG:  ${{ secrets.AZURE_RG }}
   AKS: ${{ secrets.AKS_NAME }}
-  ACR: ${{ secrets.ACR_NAME }}
 
 jobs:
   deploy_backend:
     runs-on: ubuntu-latest
     environment: Production
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Azure login
         uses: azure/login@v2
@@ -21,10 +22,10 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Set AKS context
-        run: az aks get-credentials -g "${{ secrets.AZURE_RG }}" -n "${{ secrets.AKS_NAME }}" --overwrite-existing
+        run: az aks get-credentials -g "${{ env.RG }}" -n "${{ env.AKS }}" --overwrite-existing
 
-      # NEW: create/refresh docker-registry secret for ACR pulls
-      - name: Create/Update imagePullSecret
+      # Create/refresh a docker-registry secret so the cluster can pull from your ACR
+      - name: Create/Update imagePullSecret (acr-pull)
         run: |
           kubectl create secret docker-registry acr-pull \
             --docker-server="${{ secrets.ACR_LOGIN_SERVER }}" \
@@ -33,6 +34,7 @@ jobs:
             --docker-email=ci@example.com \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      # Apply all backend resources
       - name: Apply backend K8s resources
         run: |
           kubectl apply -f k8s/configmaps.yaml
@@ -42,16 +44,40 @@ jobs:
           kubectl apply -f k8s/product-service.yaml
           kubectl apply -f k8s/order-service.yaml
 
-      # NEW: ensure deployments use the imagePullSecret without editing YAMLs
-      - name: Patch deployments to use acr-pull
+      # Discover real names (handles product-service vs product-service-w08e1, etc.)
+      - name: Discover deployment & service names by label
+        id: names
+        shell: bash
         run: |
-          kubectl patch deployment product-service-w08e1 -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
-          kubectl patch deployment order-service-w08e1   -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
+          set -e
+          PROD_DEPLOY=$(kubectl get deploy -l app=product-service -o jsonpath='{.items[0].metadata.name}')
+          ORDER_DEPLOY=$(kubectl get deploy -l app=order-service   -o jsonpath='{.items[0].metadata.name}')
+          PROD_SVC=$(kubectl get svc   -l app=product-service -o jsonpath='{.items[0].metadata.name}')
+          ORDER_SVC=$(kubectl get svc  -l app=order-service   -o jsonpath='{.items[0].metadata.name}')
+
+          echo "prod_deploy=$PROD_DEPLOY" >> $GITHUB_OUTPUT
+          echo "order_deploy=$ORDER_DEPLOY" >> $GITHUB_OUTPUT
+          echo "prod_svc=$PROD_SVC"       >> $GITHUB_OUTPUT
+          echo "order_svc=$ORDER_SVC"     >> $GITHUB_OUTPUT
+
+          echo "Discovered:"
+          echo "  Deployment (product): $PROD_DEPLOY"
+          echo "  Deployment (order):   $ORDER_DEPLOY"
+          echo "  Service    (product): $PROD_SVC"
+          echo "  Service    (order):   $ORDER_SVC"
+
+      # Ensure deployments reference the pull secret (without editing YAMLs)
+      - name: Patch deployments to use acr-pull
+        shell: bash
+        run: |
+          kubectl patch deployment "${{ steps.names.outputs.prod_deploy }}"  -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
+          kubectl patch deployment "${{ steps.names.outputs.order_deploy }}" -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
 
       - name: Wait for deployments
+        shell: bash
         run: |
-          kubectl rollout status deploy/product-service --timeout=180s || true
-          kubectl rollout status deploy/order-service   --timeout=180s || true
+          kubectl rollout status deploy/"${{ steps.names.outputs.prod_deploy }}"  --timeout=180s || true
+          kubectl rollout status deploy/"${{ steps.names.outputs.order_deploy }}" --timeout=180s || true
 
       - name: Show cluster state
         run: kubectl get deploy,svc,pods -o wide
@@ -60,12 +86,12 @@ jobs:
         id: get_ips
         shell: bash
         run: |
-          PRODUCT_IP=$(kubectl get svc product-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          ORDER_IP=$(kubectl get svc order-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          echo "PRODUCT_IP=$PRODUCT_IP" >> $GITHUB_ENV
-          echo "ORDER_IP=$ORDER_IP" >> $GITHUB_ENV
+          PRODUCT_IP=$(kubectl get svc "${{ steps.names.outputs.prod_svc }}"  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          ORDER_IP=$(kubectl get svc  "${{ steps.names.outputs.order_svc }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           echo "product_ip=$PRODUCT_IP" >> $GITHUB_OUTPUT
-          echo "order_ip=$ORDER_IP" >> $GITHUB_OUTPUT
+          echo "order_ip=$ORDER_IP"     >> $GITHUB_OUTPUT
+          echo "Product Service IP: ${PRODUCT_IP:-<pending>}"
+          echo "Order   Service IP: ${ORDER_IP:-<pending>}"
 
       - name: Logout Azure
         if: always()
