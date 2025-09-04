@@ -45,8 +45,8 @@ jobs:
       # NEW: ensure deployments use the imagePullSecret without editing YAMLs
       - name: Patch deployments to use acr-pull
         run: |
-          kubectl patch deployment product-service -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
-          kubectl patch deployment order-service   -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
+          kubectl patch deployment product-service-w08e1 -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
+          kubectl patch deployment order-service-w08e1   -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
 
       - name: Wait for deployments
         run: |
