@@ -12,10 +12,8 @@ jobs:
   deploy_backend:
     runs-on: ubuntu-latest
     environment: Production
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Azure login
         uses: azure/login@v2
@@ -23,22 +21,32 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Set AKS context
-        run: az aks get-credentials -g "$RG" -n "$AKS" --overwrite-existing
+        run: az aks get-credentials -g "${{ secrets.AZURE_RG }}" -n "${{ secrets.AKS_NAME }}" --overwrite-existing
 
-      # Only needed once, safe to leave here
-      - name: Attach ACR (idempotent)
-        run: az aks update -g "$RG" -n "$AKS" --attach-acr "$ACR"
+      # NEW: create/refresh docker-registry secret for ACR pulls
+      - name: Create/Update imagePullSecret
+        run: |
+          kubectl create secret docker-registry acr-pull \
+            --docker-server="${{ secrets.ACR_LOGIN_SERVER }}" \
+            --docker-username="${{ secrets.ACR_USERNAME }}" \
+            --docker-password="${{ secrets.ACR_PASSWORD }}" \
+            --docker-email=ci@example.com \
+            --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Apply backend K8s resources
         run: |
-          set -e
-          cd k8s
-          kubectl apply -f configmaps.yaml
-          kubectl apply -f secrets.yaml
-          kubectl apply -f product-db.yaml
-          kubectl apply -f order-db.yaml
-          kubectl apply -f product-service.yaml
-          kubectl apply -f order-service.yaml
+          kubectl apply -f k8s/configmaps.yaml
+          kubectl apply -f k8s/secrets.yaml
+          kubectl apply -f k8s/product-db.yaml
+          kubectl apply -f k8s/order-db.yaml
+          kubectl apply -f k8s/product-service.yaml
+          kubectl apply -f k8s/order-service.yaml
+
+      # NEW: ensure deployments use the imagePullSecret without editing YAMLs
+      - name: Patch deployments to use acr-pull
+        run: |
+          kubectl patch deployment product-service -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
+          kubectl patch deployment order-service   -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-pull"}]}}}}'
 
       - name: Wait for deployments
         run: |
