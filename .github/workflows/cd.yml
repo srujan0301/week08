@@ -1,0 +1,80 @@
+name: CD - Deploy to AKS (All Services)
+
+on:
+  push:
+    branches: [ "main" ]      # deploy only on main
+  workflow_dispatch: {}        # or run manually
+
+env:
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  ACR_USERNAME:     ${{ secrets.ACR_USERNAME }}
+  ACR_PASSWORD:     ${{ secrets.ACR_PASSWORD }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - uses: actions/checkout@v4
+
+      # Use uploaded kubeconfig (from GitHub Secret)
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+
+      - name: Docker login to ACR
+        run: echo "${{ env.ACR_PASSWORD }}" | docker login ${{ env.ACR_LOGIN_SERVER }} -u ${{ env.ACR_USERNAME }} --password-stdin
+
+      # --- BACKEND DEPLOYMENT ---
+      - name: Apply backend manifests
+        run: |
+          kubectl apply -f k8s/configmaps.yaml
+          kubectl apply -f k8s/secrets.yaml
+          kubectl apply -f k8s/product-db.yaml
+          kubectl apply -f k8s/order-db.yaml
+          kubectl apply -f k8s/product-service.yaml
+          kubectl apply -f k8s/order-service.yaml
+
+      - name: Wait for backend rollouts
+        run: |
+          kubectl rollout status deploy -l app=product-service --timeout=180s || true
+          kubectl rollout status deploy -l app=order-service   --timeout=180s || true
+
+      - name: Get Backend Service IPs
+        id: ips
+        shell: bash
+        run: |
+          PROD_SVC=$(kubectl get svc -l app=product-service -o jsonpath='{.items[0].metadata.name}')
+          ORDER_SVC=$(kubectl get svc -l app=order-service   -o jsonpath='{.items[0].metadata.name}')
+          PRODUCT_IP=$(kubectl get svc "$PROD_SVC"  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          ORDER_IP=$(kubectl get svc  "$ORDER_SVC"  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "product_ip=$PRODUCT_IP" >> $GITHUB_OUTPUT
+          echo "order_ip=$ORDER_IP"     >> $GITHUB_OUTPUT
+          echo "Product IP: ${PRODUCT_IP:-<pending>}"
+          echo "Order   IP: ${ORDER_IP:-<pending>}"
+
+      # --- FRONTEND DEPLOYMENT ---
+      - name: Inject backend URLs into frontend/main.js
+        run: |
+          sed -i "s|_PRODUCT_API_URL_|http://${{ steps.ips.outputs.product_ip }}:8000|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|http://${{ steps.ips.outputs.order_ip }}:8001|g" frontend/main.js
+          echo "---- main.js (first 100 lines) ----"
+          head -n 100 frontend/main.js
+
+      - name: Build & Push Frontend (deployable)
+        run: |
+          docker build -t "${{ env.ACR_LOGIN_SERVER }}/frontend:latest" ./frontend
+          docker push "${{ env.ACR_LOGIN_SERVER }}/frontend:latest"
+
+      - name: Apply frontend manifest
+        id: front
+        run: |
+          kubectl apply -f k8s/frontend.yaml
+          FRONT_DEPLOY=$(kubectl get deploy -l app=frontend -o jsonpath='{.items[0].metadata.name}')
+          echo "front_deploy=$FRONT_DEPLOY" >> $GITHUB_OUTPUT
+
+      - name: Wait for frontend rollout & show state
+        run: |
+          kubectl rollout status deploy/"${{ steps.front.outputs.front_deploy }}" --timeout=180s || true
+          kubectl get deploy,svc,pods -o wide
